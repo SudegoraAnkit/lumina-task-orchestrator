@@ -1,13 +1,17 @@
 spring:
 
   datasource:
-    url: jdbc:postgresql://localhost:5432/luminatask
+    url: jdbc:postgresql://localhost:5433/luminatask
     username: postgres
     password: postgres
+    driver-class-name: org.postgresql.Driver
 
   jpa:
     hibernate:
       ddl-auto: update
+      dialect: org.hibernate.dialect.PostgreSQLDialect
+    properties:
+      hibernate.jdbc.time_zone: UTC
 
     show-sql: true
 
