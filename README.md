@@ -79,6 +79,92 @@ I utilize **Agile methodologies** to ensure continuous value delivery:
 
 ---
 
+## 🧩 Business Domain
+
+**Enterprise Back-Office Automation for Financial Services and Operations**
+
+LuminaTask is built for business workflows that require reliable background processing of heavy operational tasks while keeping customer-facing systems responsive. It supports finance, reporting, data integration, document processing, and external service orchestration.
+
+## 🎯 Project Goal
+
+To provide a distributed, event-driven orchestration engine that safely offloads heavy business jobs from user-facing workflows, ensures reliable execution with retries and status tracking, and scales horizontally to support enterprise back-office automation.
+
+### Architecture Diagram
+```mermaid
+flowchart TD
+    subgraph Edge
+        A[Client / Web UI / Mobile App]
+    end
+
+    subgraph Gateway
+        B[API Gateway / Spring Cloud Gateway]
+    end
+
+    subgraph Services
+        C1[Auth Service]
+        C2[Task API Service]
+        C3[Reporting Service]
+        C4[Integration Service]
+    end
+
+    subgraph Messaging
+        K[Apache Kafka]
+    end
+
+    subgraph Workers
+        W1[Worker: PDF / Invoice Generator]
+        W2[Worker: Data Sync / ETL]
+        W3[Worker: OCR & Document Processing]
+        W4[Worker: External Service Orchestrator]
+    end
+
+    subgraph Persistence
+        DB1[(Postgres / Azure SQL)]
+        DB2[(MongoDB)]
+    end
+
+    subgraph Observability
+        M[Prometheus / Grafana]
+        T[Distributed Tracing]
+    end
+
+    A -->|REST / GraphQL| B
+    B -->|Auth, routing| C1
+    B -->|Task requests| C2
+    B -->|Report requests| C3
+    B -->|Integration workflows| C4
+
+    C2 -->|Persist metadata| DB1
+    C2 -->|Publish event| K
+    C3 -->|Publish report job| K
+    C4 -->|Publish integration job| K
+
+    K -->|Consume| W1
+    K -->|Consume| W2
+    K -->|Consume| W3
+    K -->|Consume| W4
+
+    W1 -->|Update status| DB1
+    W2 -->|Update status| DB1
+    W3 -->|Log output| DB2
+    W4 -->|Log output| DB2
+    W1 -->|Emit logs / traces| T
+    W2 -->|Emit logs / traces| T
+    W3 -->|Emit logs / traces| T
+    W4 -->|Emit logs / traces| T
+
+    C2 -->|Read status| DB1
+    C2 -->|Read logs| DB2
+
+    C2 -->|Metrics / traces| M
+    C3 -->|Metrics / traces| M
+    C4 -->|Metrics / traces| M
+    K -->|Metrics / traces| M
+    W1 -->|Metrics / traces| M
+    W2 -->|Metrics / traces| M
+    W3 -->|Metrics / traces| M
+    W4 -->|Metrics / traces| M
+```
 ## 🚦 Getting Started
 
 1. **Clone:** `git clone https://github.com/[YourUsername]/lumina-task.git`
