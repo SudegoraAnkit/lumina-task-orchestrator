@@ -164,7 +164,7 @@ flowchart TD
     W2 -->|Metrics / traces| M
     W3 -->|Metrics / traces| M
     W4 -->|Metrics / traces| M
-```
+```\
 ## 🚦 Getting Started
 
 1. **Clone:** `git clone https://github.com/[YourUsername]/lumina-task.git`
