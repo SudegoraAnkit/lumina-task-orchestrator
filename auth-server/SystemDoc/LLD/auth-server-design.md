@@ -7,7 +7,7 @@
 
 ## Context & Decisions
 
-When we started scaling the microservices, we quickly realized that session-based auth wouldn't work. Each service would need access to a centralized session store, creating a bottleneck and a single point of failure. 
+When we started scaling the microservices, we quickly realized that session-based auth wouldn't work. Each service would need access to a centralized session store, creating a bottleneck and a single point of failure.
 
 After reviewing options (OAuth2, custom session store, stateless JWT), we decided on **asymmetric JWT** for these reasons:
 
@@ -61,7 +61,158 @@ flowchart TB
 - JWKS endpoint accessed async and cached = Auth Server isn't a hot spot
 - API Gateway is single entry point = easier to add rate limiting, logging, TLS
 
-### 1.2 Why Two Tokens (Access + Refresh)
+### 1.2 Component Diagram
+
+This diagram shows the internal structure of the Auth Server and how its components interact:
+
+```mermaid
+graph TB
+    subgraph AuthServerInternal["🔐 Auth Server - Internal Components"]
+        HTTPLayer["HTTP Layer"]
+        
+        subgraph Controllers["Controllers"]
+            LoginCtrl["LoginController\n/auth/login"]
+            RefreshCtrl["RefreshController\n/auth/refresh"]
+            LogoutCtrl["LogoutController\n/auth/logout"]
+            ValidateCtrl["ValidateController\n/auth/validate"]
+            JwksCtrl["JwksController\n/.well-known/jwks.json"]
+        end
+        
+        subgraph SecurityLayer["🔒 Security Layer"]
+            AuthFilter["JwtAuthenticationFilter"]
+            SecurityConfig["SecurityFilterChain\nConfiguration"]
+        end
+        
+        subgraph Services["Business Services"]
+            AuthSvc["AuthService\n(auth logic)"]
+            UserSvc["UserService\n(user lookup)"]
+            TokenSvc["TokenService\n(JWT creation)"]
+            RefreshSvc["RefreshTokenService\n(token mgmt)"]
+        end
+        
+        subgraph CryptoLayer["🔑 Cryptography Layer"]
+            JwtEncoder["JwtEncoder\n(RSA private key)"]
+            JwtDecoder["JwtDecoder\n(RSA public key)"]
+            KeyManager["RSAKeyManager\n(key storage/rotation)"]
+        end
+        
+        subgraph Repository["Database Layer"]
+            UserRepo["UserRepository"]
+            RoleRepo["RoleRepository"]
+            RefreshTokenRepo["RefreshTokenRepository"]
+            UserRoleRepo["UserRoleRepository"]
+        end
+    end
+    
+    subgraph Database["📊 PostgreSQL"]
+        Users["Users Table"]
+        Roles["Roles Table"]
+        UserRoles["User_Roles Table"]
+        RefreshTokens["Refresh_Tokens Table"]
+    end
+    
+    subgraph External["External Consumers"]
+        DownstreamSvc["Downstream Services\n(Order, Product, etc)"]
+        ClientApp["Client Applications"]
+    end
+    
+    HTTPLayer --> Controllers
+    Controllers --> SecurityConfig
+    SecurityConfig --> SecurityLayer
+    SecurityLayer --> Services
+    
+    Services --> CryptoLayer
+    Services --> Repository
+    
+    CryptoLayer --> KeyManager
+    KeyManager -->|stores| KeyStorage["RSA Key Pair\n(private + public)"]
+    
+    Repository --> UserRepo
+    Repository --> RoleRepo
+    Repository --> RefreshTokenRepo
+    Repository --> UserRoleRepo
+    
+    UserRepo --> Users
+    RoleRepo --> Roles
+    RefreshTokenRepo --> RefreshTokens
+    UserRoleRepo --> UserRoles
+    
+    JwksCtrl -->|serves public key| DownstreamSvc
+    LoginCtrl -->|returns tokens| ClientApp
+    RefreshCtrl -->|returns new token| ClientApp
+    
+    classDef controller fill:#e1f5ff,stroke:#0277bd,stroke-width:2px
+    classDef service fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px
+    classDef crypto fill:#fff3e0,stroke:#f57c00,stroke-width:2px
+    classDef repo fill:#e8f5e9,stroke:#388e3c,stroke-width:2px
+    classDef db fill:#fce4ec,stroke:#c2185b,stroke-width:2px
+    
+    class LoginCtrl,RefreshCtrl,LogoutCtrl,ValidateCtrl,JwksCtrl controller
+    class AuthSvc,UserSvc,TokenSvc,RefreshSvc service
+    class JwtEncoder,JwtDecoder,KeyManager crypto
+    class UserRepo,RoleRepo,RefreshTokenRepo,UserRoleRepo repo
+    class Users,Roles,UserRoles,RefreshTokens db
+```
+
+**Component responsibilities:**
+
+| Component | Responsibility |
+|-----------|-----------------|
+| **Controllers** | Handle HTTP requests/responses, route to appropriate services |
+| **AuthService** | Orchestrate login flow: validate credentials, generate tokens |
+| **UserService** | Query users, verify passwords, load roles |
+| **TokenService** | Create & sign JWTs, handle token format |
+| **RefreshTokenService** | Manage refresh token lifecycle (create, validate, revoke) |
+| **JwtEncoder** | Sign JWTs using RSA private key |
+| **JwtDecoder** | Verify JWT signatures using RSA public key |
+| **RSAKeyManager** | Manage key pair, support key rotation, expose JWKS endpoint |
+| **Repositories** | Abstract database queries via JPA |
+
+### 1.3 Request Flow Through Components
+
+```mermaid
+sequenceDiagram
+    participant Client as Client
+    participant API as API Gateway
+    participant LC as LoginController
+    participant AuthSvc as AuthService
+    participant UserSvc as UserService
+    participant TokenSvc as TokenService
+    participant RefreshSvc as RefreshTokenService
+    participant JwtEnc as JwtEncoder
+    participant DB as Database
+    
+    Client->>API: POST /auth/login {user, pass}
+    API->>LC: Route to controller
+    
+    LC->>AuthSvc: authenticate(username, password)
+    
+    AuthSvc->>UserSvc: loadUserByUsername(username)
+    UserSvc->>DB: SELECT user WHERE username=?
+    DB-->>UserSvc: User object
+    UserSvc-->>AuthSvc: User + roles
+    
+    AuthSvc->>AuthSvc: BCrypt.verify(password)
+    alt Password invalid
+        AuthSvc-->>LC: throw BadCredentials
+        LC-->>Client: 401 Unauthorized
+    else Password valid
+        AuthSvc->>TokenSvc: createAccessToken(user)
+        TokenSvc->>JwtEnc: encode(claims)
+        JwtEnc-->>TokenSvc: signed JWT
+        TokenSvc-->>AuthSvc: accessToken
+        
+        AuthSvc->>RefreshSvc: createRefreshToken(user)
+        RefreshSvc->>RefreshSvc: generateRandomToken()
+        RefreshSvc->>DB: INSERT token_hash (SHA-256)
+        RefreshSvc-->>AuthSvc: refreshToken
+        
+        AuthSvc-->>LC: {accessToken, refreshToken}
+        LC-->>Client: 200 OK {tokens}
+    end
+```
+
+### 1.4 Why Two Tokens (Access + Refresh)
 
 Early iterations used a single long-lived token. We hit these issues:
 
@@ -351,6 +502,7 @@ These are on the backlog but not blocking launch:
 If something is unclear:
 1. Check the sequence diagram (Section 2.2) for the happy path
 2. Check the ER diagram (Section 3.1) for schema details
-3. Check the API contracts (Section 4) for exact payloads
+3. Check the component diagram (Section 1.2) for internal structure
+4. Check the API contracts (Section 4) for exact payloads
 
 If still stuck, ask in `#backend-dev` on Slack.
