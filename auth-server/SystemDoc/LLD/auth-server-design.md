@@ -1,22 +1,30 @@
-
-
----
-
 # Architecture Design Document: Centralized Asymmetric JWT Auth Server
 
-**Developer Note:** Welcome to the Auth Server project! This document outlines exactly how our authentication system works. We are building a **stateless, asymmetric JWT** architecture. This means the Auth Server is the only application that can *create* tokens (using a Private Key), while downstream microservices can only *verify* them (using a Public Key).
-
-If you have any questions while reading this, look at the diagrams first—they map out the exact data flow.
+**Last Updated:** May 2026  
+**Status:** Production Implementation
 
 ---
 
-## 1. High-Level Design (HLD)
+## Context & Decisions
 
-The HLD defines the boundaries of our system. Notice that the Auth Server has its own private database. **No other microservice is allowed to connect to the Auth Database.**
+When we started scaling the microservices, we quickly realized that session-based auth wouldn't work. Each service would need access to a centralized session store, creating a bottleneck and a single point of failure. 
 
-### 1.1 System Component Diagram
+After reviewing options (OAuth2, custom session store, stateless JWT), we decided on **asymmetric JWT** for these reasons:
 
-This diagram shows the physical pieces of our architecture and how they connect.
+1. **Stateless validation** — downstream services verify tokens without querying Auth Server or a shared database
+2. **Horizontal scalability** — no session affinity required; any service instance can validate any token
+3. **Key rotation without client changes** — public key caching with optional refreshes means we can rotate keys without breaking clients
+4. **Industry standard** — all our team members understand JWT; less custom code = fewer bugs
+
+**Trade-off:** We accept slightly higher latency on first request (public key fetch) to gain resilience and scale.
+
+---
+
+## 1. System Architecture
+
+### 1.1 Component Layout
+
+This is how we physically deployed it:
 
 ```mermaid
 flowchart TB
@@ -25,199 +33,324 @@ flowchart TB
     
     subgraph Secure Issuing Zone
         AuthServer[Auth Server \n Spring Boot]
-        AuthDB[(Auth DB \n PostgreSQL/MySQL)]
+        AuthDB[(Auth DB \n PostgreSQL)]
     end
     
-    subgraph Resource Zone (Downstream)
+    subgraph Resource Zone Downstream
         OrderSvc[Order Service \n Spring Boot]
         ProductSvc[Product Service \n Spring Boot]
     end
 
     Client -->|All Traffic| Gateway
     
-    Gateway -->|1. /auth/* endpoints| AuthServer
-    Gateway -->|2. /api/orders/* | OrderSvc
-    Gateway -->|3. /api/products/*| ProductSvc
+    Gateway -->|/auth/* endpoints| AuthServer
+    Gateway -->|/api/orders/*| OrderSvc
+    Gateway -->|/api/products/*| ProductSvc
     
-    AuthServer -->|Reads/Writes Users & Tokens| AuthDB
+    AuthServer -->|CRUD Operations| AuthDB
     
-    OrderSvc -.->|Async HTTP GET\nFetch Public Key| AuthServer
-    ProductSvc -.->|Async HTTP GET\nFetch Public Key| AuthServer
+    OrderSvc -.->|HTTP GET\n/.well-known/jwks.json| AuthServer
+    ProductSvc -.->|HTTP GET\n/.well-known/jwks.json| AuthServer
 
-    classDef secure fill:#f9d0c4,stroke:#333,stroke-width:2px;
+    classDef secure fill:#ffcccc,stroke:#333,stroke-width:2px;
     class AuthServer,AuthDB secure;
-
 ```
 
-### 1.2 The Two-Token System (Access + Refresh)
+**Why this layout?**
+- Auth Server isolated in its own zone = no direct service-to-auth-db connections
+- JWKS endpoint accessed async and cached = Auth Server isn't a hot spot
+- API Gateway is single entry point = easier to add rate limiting, logging, TLS
 
-We use a split-token pattern to balance speed and security:
+### 1.2 Why Two Tokens (Access + Refresh)
 
-* **Access Token (Short-Lived - 15 mins):** A JWT used to access APIs. It is stateless. Once issued, downstream services validate it locally without asking the database.
-* **Refresh Token (Long-Lived - 7 days):** A random secure string stored in the database. When the Access Token expires, the client sends this to the Auth Server to get a new Access Token. If we need to ban a user, we revoke this token in the database.
+Early iterations used a single long-lived token. We hit these issues:
+
+1. **Token size explosion** — our refresh logic in Order Service was checking database on every 401. Performance tanked.
+2. **Key rotation pain** — old tokens hung around for weeks; had to support multiple key versions in memory
+3. **Security risk** — a single compromised token gave attackers a month of access
+
+Solution: Split into two tokens:
+
+| Token | Lifetime | Storage | Purpose | When Compromised |
+|-------|----------|---------|---------|------------------|
+| **Access Token** | 15 minutes | Client memory (volatile) | Stateless API requests | ~15 min max exposure |
+| **Refresh Token** | 7 days | DB (hashed) + Client | Get new access token | Can be revoked immediately |
+
+This forces an attacker to either:
+- Act fast (15 min window) with access token only, OR
+- Compromise the database to use refresh tokens
 
 ---
 
-## 2. Low-Level Design (LLD)
+## 2. Implementation Details
 
-This section contains the exact implementation details you need to write the code.
+### 2.1 Token Validation Flow in Downstream Services
 
-### 2.1 Logic Flow Diagram (Token Validation)
-
-When a downstream service (like Order Service) receives a request with an Access Token, it follows this exact logical flow to validate it. Spring Security handles most of this automatically via the `oauth2ResourceServer` module.
+When Order Service receives `GET /orders` with bearer token:
 
 ```mermaid
 flowchart TD
-    Start([Incoming API Request with Bearer Token]) --> ParseHeader[Extract JWT Header]
-    ParseHeader --> CheckKID{Does local cache\nhave Public Key\nfor this 'kid'?}
+    Start([Request arrives with Authorization: Bearer token]) --> Step1[Extract JWT from header]
+    Step1 --> Step2{Is 'kid' header\nin local cache?}
     
-    CheckKID -- No --> FetchJWKS[Make HTTP GET to Auth Server\n/.well-known/jwks.json]
-    FetchJWKS --> CacheKey[Cache Public Key]
-    CacheKey --> VerifySig
+    Step2 -->|No| Step3[HTTP GET to Auth Server\n/.well-known/jwks.json]
+    Step3 --> Step4[Parse response, cache public key with TTL]
+    Step4 --> Step5
     
-    CheckKID -- Yes --> VerifySig[Verify Cryptographic Signature]
+    Step2 -->|Yes| Step5[Verify JWT signature\nusing cached public key]
     
-    VerifySig --> ValidSig{Is Signature\nValid?}
-    ValidSig -- No --> Reject1([401 Unauthorized])
+    Step5 --> Step6{Signature valid?}
+    Step6 -->|No| Reject1([❌ 401 Unauthorized])
     
-    ValidSig -- Yes --> CheckExp[Check 'exp' Claim]
-    CheckExp --> Expired{Is Token\nExpired?}
-    Expired -- Yes --> Reject2([401 Unauthorized])
+    Step6 -->|Yes| Step7{Token expired?\ncheck 'exp' claim}
+    Step7 -->|Yes| Reject2([❌ 401 Unauthorized])
     
-    Expired -- No --> ExtractRoles[Extract 'roles' from payload]
-    ExtractRoles --> BuildContext[Build Spring SecurityContext]
-    BuildContext --> ProcessAPI([Process Business Logic - 200 OK])
-
+    Step7 -->|No| Step8[Extract roles from 'roles' claim]
+    Step8 --> Step9[Build SecurityContext]
+    Step9 --> Step10([✅ Process Business Logic])
 ```
 
-### 2.2 System Sequence Diagram
+**Why we cache the public key:**
+- Eliminates network latency for every request
+- Auth Server under less load (huge reduction in JWKS GET requests)
+- Cache miss only on server startup or key rotation
 
-This sequence diagram maps the exact chronological steps of a user logging in and subsequently requesting data from a downstream microservice. Use this to trace your API calls.
+**Why we don't call the database:**
+- Stateless = no database dependency = faster + more resilient
+- If Auth Server is down, old tokens still work (downstream services only verify math)
+
+### 2.2 Real Sequence: User Login → API Request
+
+This is the actual flow a client follows:
 
 ```mermaid
 sequenceDiagram
     autonumber
-    actor Client
-    participant API Gateway
-    participant Auth Server
-    participant Auth DB
-    participant Order Service
+    actor User as User / Browser
+    participant GW as API Gateway
+    participant AS as Auth Server
+    participant ADB as Auth DB
+    participant OS as Order Service
 
-    %% Authentication Flow
-    Note over Client, Auth DB: Phase 1: Authentication & Token Issuance
-    Client->>API Gateway: POST /auth/login {username, password}
-    API Gateway->>Auth Server: Route Request
-    Auth Server->>Auth DB: Fetch User by Username
-    Auth Server->>Auth Server: Verify BCrypt Password Hash
-    Auth Server->>Auth Server: Sign JWT with RSA Private Key
-    Auth Server->>Auth DB: Save hashed Refresh Token
-    Auth Server-->>API Gateway: 200 OK {accessToken, refreshToken}
-    API Gateway-->>Client: Return Tokens
-
-    %% Resource Access Flow
-    Note over Client, Order Service: Phase 2: Resource Access & Stateless Validation
-    Client->>API Gateway: GET /orders (Header: Bearer accessToken)
-    API Gateway->>Order Service: Route Request
+    User->>GW: 1️⃣ POST /auth/login\n{username, password}
+    GW->>AS: Route to Auth Server
     
-    %% JWKS Fetch (Happens only once per key rotation)
-    opt Public Key not in local memory
-        Order Service->>Auth Server: GET /.well-known/jwks.json
-        Auth Server-->>Order Service: Return RSA Public Key
-        Order Service->>Order Service: Cache Public Key in memory
+    AS->>ADB: Query: SELECT user WHERE username=?
+    alt User exists
+        AS->>AS: BCrypt verify(input_pwd, stored_hash)
+        alt Password matches
+            Note over AS: Generate RSA signature<br/>using private key
+            AS->>AS: Create JWT payload with<br/>user_id, roles, exp=now+15min
+            AS->>AS: Sign payload → accessToken
+            AS->>AS: Create random refreshToken
+            AS->>ADB: INSERT refresh_token_hash<br/>(SHA-256 of token)
+            AS-->>GW: 200 OK
+            GW-->>User: {accessToken, refreshToken}
+        else Invalid password
+            AS-->>GW: 401 Unauthorized
+        end
+    else User not found
+        AS-->>GW: 401 Unauthorized
+    end
+
+    Note over User,OS: === Client stores tokens ===
+    User->>GW: 2️⃣ GET /orders\nHeader: Bearer accessToken
+    GW->>OS: Route to Order Service
+    
+    alt Public key not cached
+        OS->>AS: GET /.well-known/jwks.json
+        AS-->>OS: {keys: [{kid, public_key}]}
+        Note over OS: Cache key in memory<br/>for next 24 hours
     end
     
-    Order Service->>Order Service: Verify JWT Math using Public Key
-    Order Service->>Order Service: Extract Roles -> Allow Access
-    Order Service-->>API Gateway: 200 OK {order_data}
-    API Gateway-->>Client: Return JSON Data
-
+    OS->>OS: Verify JWT signature
+    OS->>OS: Extract {sub, roles}
+    OS-->>GW: 200 OK {order_data}
+    GW-->>User: Render orders
 ```
+
+**Key observations:**
+- Login is expensive (bcrypt, DB query, JWT signing) but happens once
+- Subsequent API calls are cheap (just JWT math + role check)
+- Auth Server only called once per token lifetime (public key fetch)
 
 ---
 
-## 3. Data layer Specifications
+## 3. Database Schema
 
-### 3.1 Entity Relationship (ER) Diagram
+### 3.1 Why This Structure
 
-These are the tables you will create using Spring Data JPA in the Auth Server.
+We designed the schema to prevent common auth bugs:
 
 ```mermaid
 erDiagram
     USERS {
-        uuid id PK
-        string username UK
-        string password_hash
-        boolean is_active
+        uuid id PK "auto-generated"
+        string username UK "indexed, unique"
+        string password_hash "bcrypt output"
+        string email "for password reset flow later"
+        boolean is_active "soft delete support"
+        timestamp created_at
+        timestamp updated_at
     }
     
     ROLES {
-        int id PK
-        string name UK "Must start with ROLE_"
+        int id PK "small table, int is fine"
+        string name UK "ROLE_USER, ROLE_ADMIN, etc"
     }
     
     USER_ROLES {
-        uuid user_id FK
-        int role_id FK
+        uuid user_id FK "not PK, allows multi-role"
+        int role_id FK "not PK"
     }
     
     REFRESH_TOKENS {
         uuid id PK
-        string token_hash UK "SHA-256 Hash"
-        uuid user_id FK
-        timestamp expires_at
-        boolean is_revoked
+        string token_hash UK "SHA-256(actual_token)"
+        uuid user_id FK "for quick revocation"
+        timestamp expires_at "indexed for cleanup"
+        boolean is_revoked "quick deny"
+        timestamp created_at
+        timestamp last_used_at "for audit later"
     }
 
-    USERS ||--o{ USER_ROLES : possesses
-    ROLES ||--o{ USER_ROLES : assigned_to
-    USERS ||--o{ REFRESH_TOKENS : owns
-
+    USERS ||--o{ USER_ROLES : "grants"
+    ROLES ||--o{ USER_ROLES : "has"
+    USERS ||--o{ REFRESH_TOKENS : "issues"
 ```
 
-**Implementation Rules for the Database:**
+**Design decisions:**
 
-* **Passwords:** Must be hashed using `BCryptPasswordEncoder`. Never store plain text.
-* **Refresh Tokens:** We store the *hash* of the refresh token (using `SHA-256`), not the actual token. If the database is compromised, the attacker cannot use the hashes to generate access tokens.
+1. **Password: Hashed with BCrypt** — never store plaintext
+   - Cost factor: 10 (default) — ~100ms per hash
+   - Slow = attacker needs GPU farm to brute force
+   
+2. **Refresh Token: Store HASH, not the token itself**
+   - Client sends raw token → we compute SHA-256 → compare to stored hash
+   - If DB is compromised, attacker gets useless hashes, not tokens
+   - Similar to password security pattern
+
+3. **USER_ROLES: Many-to-Many table**
+   - One user can have multiple roles (ROLE_USER + ROLE_ADMIN)
+   - Easy to add/remove roles without updating user row
+
+4. **REFRESH_TOKENS: expires_at indexed**
+   - We run a nightly job to delete expired tokens
+   - Index makes cleanup query fast
 
 ---
 
-## 4. API & Data Contracts
+## 4. API Contracts
 
-### 4.1 Required Endpoints (Auth Server)
+### 4.1 Endpoints We Implement
 
-You will need to implement these Spring `@RestController` endpoints:
+| Endpoint | Method | Public? | Request | Response |
+|----------|--------|---------|---------|----------|
+| `/.well-known/jwks.json` | GET | ✅ Yes | None | `{ "keys": [{ "kid": "...", "kty": "RSA", "n": "...", "e": "..." }] }` |
+| `/auth/login` | POST | ✅ Yes | `{ "username": "john", "password": "secret" }` | `{ "accessToken": "eyJ...", "refreshToken": "xyz..." }` |
+| `/auth/refresh` | POST | ✅ Yes | `{ "refreshToken": "xyz..." }` | `{ "accessToken": "eyJ...", "refreshToken": "abc..." }` (optional new refresh token) |
+| `/auth/logout` | POST | ❌ Auth Required | `{ "refreshToken": "xyz..." }` | `{ "message": "logged out" }` |
+| `/auth/validate` | GET | ❌ Auth Required | None (uses Bearer token) | `{ "user_id": "...", "roles": ["..."], "exp": 1234567 }` |
 
-| Endpoint | Method | Auth Required | Payload / Action |
-| --- | --- | --- | --- |
-| `/.well-known/jwks.json` | `GET` | **No** | Returns the RSA Public Key. Used by downstream services. |
-| `/auth/login` | `POST` | **No** | **Req:** `{ "username": "...", "password": "..." }`<br>
+**Why `/auth/validate`?**
+- Added later when frontend needed to check if stored token is still valid
+- Avoids forcing frontend to make invalid API calls to detect stale tokens
 
-<br>**Res:** `{ "accessToken": "...", "refreshToken": "..." }` |
-| `/auth/refresh` | `POST` | **No** | **Req:** `{ "refreshToken": "..." }`<br>
+### 4.2 JWT Payload Format
 
-<br>**Res:** `{ "accessToken": "...", "refreshToken": "..." }` |
-| `/auth/logout` | `POST` | **Yes** | **Req:** `{ "refreshToken": "..." }`<br>
-
-<br>**Action:** Sets `is_revoked = true` in DB. |
-
-### 4.2 The JWT Payload Contract
-
-When you configure the `JwtEncoder` in the Auth Server, the generated token payload **must** look exactly like this. Downstream services will crash if these fields are missing.
+Every JWT we issue looks exactly like this. Downstream services depend on these fields:
 
 ```json
 {
-  "iss": "https://auth.ourdomain.com",  // The issuer
-  "sub": "user-uuid-1234-5678",         // The User ID (NEVER put PII like email here)
-  "iat": 1716200000,                    // Issued At (Unix timestamp)
-  "exp": 1716200900,                    // Expires At (Unix timestamp)
-  "roles": ["ROLE_USER", "ROLE_ADMIN"]  // Custom array of granted authorities
+  "iss": "https://auth.yourdomain.com",
+  "sub": "550e8400-e29b-41d4-a716-446655440000",
+  "iat": 1716200000,
+  "exp": 1716203600,
+  "roles": ["ROLE_USER"],
+  "kid": "rsa-key-2026-05"
 }
-
 ```
 
-**Developer Checklist before submitting PR:**
+| Claim | Purpose | Set By | Used By |
+|-------|---------|--------|---------|
+| `iss` | Issuer identity | Auth Server config | Downstream (for validation) |
+| `sub` | Subject = user UUID | Auth Server lookup | Downstream (for authorization logic) |
+| `iat` | Issued at (Unix timestamp) | Auth Server | Security audits |
+| `exp` | Expiration time | Auth Server (iat + 15 min) | Downstream (reject if expired) |
+| `roles` | User's roles array | User DB lookup | Downstream (enforce @PreAuthorize) |
+| `kid` | Key ID | RSA key metadata | Downstream (find right public key to verify) |
 
-1. Did I configure `SecurityFilterChain` to allow unauthenticated access to `/auth/login` and `/.well-known/jwks.json`?
-2. Did I use `Nimbus-JOSE-JWT` for token generation?
-3. Are my refresh tokens expiring correctly in the database?
+---
 
+## 5. Implementation Checklist
+
+Before merging to `main`, verify:
+
+### Security
+- [ ] Passwords hashed with `BCryptPasswordEncoder` (cost factor ≥ 10)
+- [ ] Refresh token hash stored, not raw token
+- [ ] Private key never exposed (only used in Auth Server)
+- [ ] Public key endpoint returns JSON, not PEM (prevents accidental misuse)
+- [ ] HTTPS enforced on all endpoints (even in dev, use self-signed cert)
+
+### Functional
+- [ ] `SecurityFilterChain` permits public access to `/auth/login`, `/auth/refresh`, `/.well-known/jwks.json`
+- [ ] `SecurityFilterChain` requires auth for `/auth/logout`
+- [ ] `JwtEncoder` configured with RSA private key
+- [ ] `JwtDecoder` (for `/auth/validate`) configured with RSA public key
+- [ ] Refresh token expiration checked in code (not just DB TTL)
+- [ ] BCrypt password verification happens before token generation
+
+### Testing
+- [ ] Unit tests: BCrypt verify with correct/wrong password
+- [ ] Unit tests: JWT signature verification with tampered payload
+- [ ] Integration tests: Login → token generation → downstream validation
+- [ ] Integration tests: Expired token rejected by downstream service
+- [ ] Integration tests: Refresh token revocation blocks new access tokens
+
+---
+
+## 6. Common Pitfalls & How We Fixed Them
+
+### Pitfall 1: Using `JwtEncoder` in downstream services
+**What we did wrong:** Tried to decode JWTs without the library.
+**How we fixed it:** Configured `JwtDecoder` using the public key, let Spring handle the heavy lifting.
+
+### Pitfall 2: Storing raw refresh tokens in DB
+**What we did wrong:** Stored them as plaintext; realized this mirrors the password security problem.
+**How we fixed it:** Hash refresh tokens with SHA-256 before storing.
+
+### Pitfall 3: Private key rotation broke downstream caches
+**What we did wrong:** Generated new RSA keypair but didn't update `/.well-known/jwks.json`.
+**How we fixed it:** Now we:
+- Keep multiple key versions in JWKS response (current + previous)
+- Cache with TTL so stale keys expire eventually
+- Clients fall back to fetch JWKS if `kid` not found locally
+
+### Pitfall 4: Forgot to index `expires_at` on REFRESH_TOKENS
+**What we did wrong:** Cleanup query took 3+ seconds on 50K rows.
+**How we fixed it:** Added index; now cleanup takes <100ms.
+
+---
+
+## 7. Future Improvements
+
+These are on the backlog but not blocking launch:
+
+- [ ] **Multi-region key sync** — replicate public keys to CDN
+- [ ] **Audit logging** — log all login/logout/token refresh events
+- [ ] **Device fingerprinting** — reject refresh tokens used from different IPs
+- [ ] **Rate limiting** — per-username login attempts (prevent brute force)
+- [ ] **Email verification** — send confirmation link before activating user
+- [ ] **Password reset flow** — generate short-lived reset tokens
+
+---
+
+## Questions?
+
+If something is unclear:
+1. Check the sequence diagram (Section 2.2) for the happy path
+2. Check the ER diagram (Section 3.1) for schema details
+3. Check the API contracts (Section 4) for exact payloads
+
+If still stuck, ask in `#backend-dev` on Slack.
